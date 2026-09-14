@@ -1036,15 +1036,26 @@ function findPlacement(track){
 function addClip(type='none',track=null,startOverride=null){
   if(state.tracks<=0){toast('Add a Camera track first');return null}
   if(track==null){const sel=state.clips.find(c=>c.id===state.selectedId);track=sel?sel.track:0}
-  track=clamp(track,0,state.tracks-1);let desired=startOverride==null?findPlacement(track):clamp(startOverride,0,state.duration);
-  if(state.snap&&startOverride!=null)desired=snapClipMove(desired,Math.min(2.0,Math.max(MIN_CLIP,state.duration-desired)),null).value;
-  const trackIsEmpty=!state.clips.some(c=>c.track===track);
-  const emptyTrackStart=clamp(desired,0,Math.max(0,state.duration-MIN_CLIP));
-  const placement=trackIsEmpty
-    ? {start:emptyTrackStart,duration:Math.min(2.0,Math.max(MIN_CLIP,state.duration-emptyTrackStart))}
-    : (state.snap?snappedNewPlacement(track,desired,2.0):newPlacement(track,desired,2.0));
+  track=clamp(track,0,state.tracks-1);
+  const droppedOnTimeline=startOverride!=null;
+  let placement;
+  if(droppedOnTimeline){
+    // A layer dragged from the New Camera button is placed from the actual pointer
+    // time, not from the old "next available slot" rule. It keeps its normal 2 s
+    // duration and projects to the nearest legal non-overlapping position.
+    placement=newCameraDropPlacement(track,Math.max(0,startOverride),2.0);
+  }else{
+    const desired=findPlacement(track),trackIsEmpty=!state.clips.some(c=>c.track===track),emptyTrackStart=clamp(desired,0,Math.max(0,state.duration-MIN_CLIP));
+    placement=trackIsEmpty
+      ? {start:emptyTrackStart,duration:Math.min(2.0,Math.max(MIN_CLIP,state.duration-emptyTrackStart))}
+      : (state.snap?snappedNewPlacement(track,desired,2.0):newPlacement(track,desired,2.0));
+  }
   if(!placement){toast('No free space on this camera track');return null}
-  pushHistory();const c=defaultClip(type,track,placement.start,placement.duration);state.clips.push(c);state.transitions[entryTransitionKey(c)]={fusion:DEFAULT_FUSION};state.selectedId=c.id;state.selectedClipIds=[c.id];state.selectedSourceIds=[];state.selectedSourceId=null;state.selectionAnchor={kind:'clip',id:c.id};state.selectionKind='clip';
+  pushHistory();
+  // defaultClip historically capped duration to the current sequence end. Extend the
+  // sequence first so a new layer dropped near/past the old end stays a full 2 s.
+  state.duration=Math.max(state.duration,placement.start+placement.duration);
+  const c=defaultClip(type,track,placement.start,placement.duration);state.clips.push(c);state.transitions[entryTransitionKey(c)]={fusion:DEFAULT_FUSION};state.selectedId=c.id;state.selectedClipIds=[c.id];state.selectedSourceIds=[];state.selectedSourceId=null;state.selectionAnchor={kind:'clip',id:c.id};state.selectionKind='clip';
   renderTimeline();renderInspector();setTime(Math.min(c.start+.001,state.duration),false);scrollClipIntoView(c);return c;
 }
 function selectedClips(){return state.clips.filter(c=>state.selectedClipIds.includes(c.id))}
@@ -1285,16 +1296,14 @@ function cameraLayerOverlaps(track,start,duration,excludeId=null){
   const end=start+duration,eps=1e-6;
   return state.clips.some(x=>x.track===track&&x.id!==excludeId&&start<x.start+x.duration-eps&&end>x.start+eps);
 }
-function clampCameraMoveStart(orig,targetTrack,desiredStart,excludeId){
-  desiredStart=Math.max(0,desiredStart);
-  const duration=orig.duration,eps=1e-6;
-  const blockers=state.clips.filter(x=>x.track===targetTrack&&x.id!==excludeId).sort((a,b)=>a.start-b.start||a.id.localeCompare(b.id));
+function nearestFreeCameraStart(track,desiredStart,duration,excludeId=null,tieDirection=0){
+  desiredStart=Math.max(0,desiredStart);duration=Math.max(MIN_CLIP,duration);
+  const eps=1e-6,blockers=state.clips.filter(x=>x.track===track&&x.id!==excludeId).sort((a,b)=>a.start-b.start||a.id.localeCompare(b.id));
   if(!blockers.length)return desiredStart;
 
-  // Build every interval in which the WHOLE moving layer can fit. Collision remains
-  // a hard rule, but it is no longer a wall tied to the layer's original side.
-  // This means dragging past another layer can reorder the two: once the pointer is
-  // closer to the free space on the opposite side, the moving layer crosses over.
+  // Convert the occupied Camera track into valid START intervals for a layer of this
+  // duration. The final interval is intentionally unbounded so both existing layers
+  // and brand-new layers can be moved/dropped beyond the old end of the timeline.
   const free=[];let cursor=0;
   for(const blocker of blockers){
     const latestStartBefore=blocker.start-duration;
@@ -1303,19 +1312,33 @@ function clampCameraMoveStart(orig,targetTrack,desiredStart,excludeId){
   }
   free.push({min:cursor,max:Infinity});
 
-  const movingLeft=desiredStart<orig.start-eps;
   let best=desiredStart,bestDistance=Infinity;
   for(const gap of free){
     let candidate=desiredStart;
     if(candidate<gap.min)candidate=gap.min;
     if(candidate>gap.max)candidate=gap.max;
-    const distance=Math.abs(candidate-desiredStart);
-    const tie=Math.abs(distance-bestDistance)<=eps;
-    if(distance<bestDistance-eps||(tie&&((movingLeft&&candidate<best)||(!movingLeft&&candidate>best)))){
+    const distance=Math.abs(candidate-desiredStart),tie=Math.abs(distance-bestDistance)<=eps;
+    if(distance<bestDistance-eps||(tie&&((tieDirection<0&&candidate<best)||(tieDirection>0&&candidate>best)))){
       bestDistance=distance;best=candidate;
     }
   }
   return Math.max(0,best);
+}
+function clampCameraMoveStart(orig,targetTrack,desiredStart,excludeId){
+  const eps=1e-6,tieDirection=desiredStart<orig.start-eps?-1:desiredStart>orig.start+eps?1:0;
+  return nearestFreeCameraStart(targetTrack,desiredStart,orig.duration,excludeId,tieDirection);
+}
+function newCameraDropPlacement(track,desiredStart,desiredDuration=2.0){
+  const duration=Math.max(MIN_CLIP,desiredDuration);
+  // New layers use exactly the same non-overlap model as layers already on the
+  // timeline. On an exact tie, favour the forward side: dropping beyond an existing
+  // layer must never make the new layer jump automatically behind it.
+  let start=nearestFreeCameraStart(track,Math.max(0,desiredStart),duration,null,1),snap=null;
+  if(state.snap){
+    const res=snapClipMove(start,duration,null),candidate=Math.max(0,res.value);
+    if(!cameraLayerOverlaps(track,candidate,duration,null)){start=candidate;snap=res.snap}
+  }
+  return {start,duration,snap};
 }
 function onClipPointerDown(e){
   if(e.button!==0)return;e.stopPropagation();const el=e.currentTarget,c=state.clips.find(x=>x.id===el.dataset.id);if(!c)return;
@@ -1378,7 +1401,9 @@ function bindAdjustmentDropLane(lane,track){
   lane.addEventListener('dragleave',e=>{if(!lane.contains(e.relatedTarget))lane.classList.remove('drop-target')});
   lane.addEventListener('drop',e=>{
     if(!e.dataTransfer?.types?.includes('application/x-camera-adjustment'))return;e.preventDefault();$$('.lane.adjustment.drop-target').forEach(x=>x.classList.remove('drop-target'));
-    const rect=lane.getBoundingClientRect(),time=clamp((e.clientX-rect.left)/state.pps,0,state.duration);addClip('none',track,time);
+    // Do not clamp to the old sequence duration: dropping in visible empty timeline
+    // space is allowed to extend the composition, exactly like moving an existing layer.
+    const rect=lane.getBoundingClientRect(),time=Math.max(0,(e.clientX-rect.left)/state.pps);addClip('none',track,time);
   });
 }
 
