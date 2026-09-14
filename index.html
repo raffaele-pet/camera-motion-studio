@@ -1042,7 +1042,7 @@ function addClip(type='none',track=null,startOverride=null){
   const emptyTrackStart=clamp(desired,0,Math.max(0,state.duration-MIN_CLIP));
   const placement=trackIsEmpty
     ? {start:emptyTrackStart,duration:Math.min(2.0,Math.max(MIN_CLIP,state.duration-emptyTrackStart))}
-    : snappedNewPlacement(track,desired,2.0);
+    : (state.snap?snappedNewPlacement(track,desired,2.0):newPlacement(track,desired,2.0));
   if(!placement){toast('No free space on this camera track');return null}
   pushHistory();const c=defaultClip(type,track,placement.start,placement.duration);state.clips.push(c);state.transitions[entryTransitionKey(c)]={fusion:DEFAULT_FUSION};state.selectedId=c.id;state.selectedClipIds=[c.id];state.selectedSourceIds=[];state.selectedSourceId=null;state.selectionAnchor={kind:'clip',id:c.id};state.selectionKind='clip';
   renderTimeline();renderInspector();setTime(Math.min(c.start+.001,state.duration),false);scrollClipIntoView(c);return c;
@@ -1089,9 +1089,10 @@ function timelineWidth(){return Math.max($('#timelineScroll').clientWidth||900,s
 function playheadTimeFromPointer(ev){
   const rect=$('.ruler').getBoundingClientRect();
   const raw=clamp((ev.clientX-rect.left+$('#timelineScroll').scrollLeft)/state.pps,0,state.duration);
-  if(!ev.shiftKey)return {value:raw,snap:null};
-  const threshold=14/state.pps;
-  const candidates=[];
+  // Shift enables magnetic playhead scrubbing only while the global Snap switch is on.
+  if(!ev.shiftKey||!state.snap)return {value:raw,snap:null};
+  const threshold=snapThresholdSeconds(14),candidates=[];
+  for(const source of state.sources)candidates.push(source.start,sourceEnd(source));
   for(const c of state.clips)candidates.push(c.start,c.start+c.duration);
   let best=null,dist=Infinity;
   for(const edge of candidates){const d=Math.abs(edge-raw);if(d<dist&&d<=threshold){best=edge;dist=d}}
@@ -1158,11 +1159,17 @@ function setEditTool(tool){
   if(state.editTool==='cut')toast('Cut Tool · click a GLB clip to split');
 }
 function sourceSnapTime(value,excludeIds=new Set()){
-  if(!state.snap)return {value,snap:null};const threshold=8/state.pps,candidates=[0,state.currentTime];
+  if(!state.snap)return {value,snap:null};
+  // Use the same screen-space snap sensitivity as Camera layers. Because the
+  // threshold is measured in pixels, zooming the timeline automatically makes
+  // snapping more or less temporally precise, like a conventional NLE.
+  const threshold=snapThresholdSeconds(),candidates=[0,state.duration,state.currentTime];
   for(const s of state.sources)if(!excludeIds.has(s.id))candidates.push(s.start,sourceEnd(s));
   for(const c of state.clips)candidates.push(c.start,c.start+c.duration);
   let best=null,bd=Infinity;for(const x of candidates){const d=Math.abs(x-value);if(d<bd&&d<=threshold){bd=d;best=x}}
-  if(best!=null)return {value:best,snap:best};const grid=.1,g=Math.round(value/grid)*grid;return Math.abs(g-value)<=threshold*.55?{value:g,snap:g}:{value,snap:null};
+  if(best!=null)return {value:best,snap:best};
+  const grid=.1,g=Math.round(value/grid)*grid,gridThreshold=snapThresholdSeconds(SNAP_GRID_PX);
+  return Math.abs(g-value)<=gridThreshold?{value:g,snap:g}:{value,snap:null};
 }
 function sourceNeighborBounds(source){
   const ordered=state.sources.filter(s=>s.id!==source.id).sort((a,b)=>a.start-b.start),prev=ordered.filter(s=>sourceEnd(s)<=source.start+1e-5).at(-1),next=ordered.find(s=>s.start>=sourceEnd(source)-1e-5);
@@ -1274,22 +1281,76 @@ function snapClipMove(start,duration,excludeId=null){
   return gridSnap==null?{value:start,snap:null}:{value:start+gridDelta,snap:gridSnap};
 }
 function showSnap(x){const l=$('#snapline');if(!l)return;if(x==null){l.style.display='none'}else{l.style.display='block';l.style.left=`${x*state.pps}px`}}
+function cameraLayerOverlaps(track,start,duration,excludeId=null){
+  const end=start+duration,eps=1e-6;
+  return state.clips.some(x=>x.track===track&&x.id!==excludeId&&start<x.start+x.duration-eps&&end>x.start+eps);
+}
+function clampCameraMoveStart(orig,targetTrack,desiredStart,excludeId){
+  desiredStart=Math.max(0,desiredStart);
+  const duration=orig.duration,eps=1e-6;
+  const blockers=state.clips.filter(x=>x.track===targetTrack&&x.id!==excludeId).sort((a,b)=>a.start-b.start||a.id.localeCompare(b.id));
+  if(!blockers.length)return desiredStart;
+
+  // Build every interval in which the WHOLE moving layer can fit. Collision remains
+  // a hard rule, but it is no longer a wall tied to the layer's original side.
+  // This means dragging past another layer can reorder the two: once the pointer is
+  // closer to the free space on the opposite side, the moving layer crosses over.
+  const free=[];let cursor=0;
+  for(const blocker of blockers){
+    const latestStartBefore=blocker.start-duration;
+    if(latestStartBefore>=cursor-eps)free.push({min:cursor,max:Math.max(cursor,latestStartBefore)});
+    cursor=Math.max(cursor,blocker.start+blocker.duration);
+  }
+  free.push({min:cursor,max:Infinity});
+
+  const movingLeft=desiredStart<orig.start-eps;
+  let best=desiredStart,bestDistance=Infinity;
+  for(const gap of free){
+    let candidate=desiredStart;
+    if(candidate<gap.min)candidate=gap.min;
+    if(candidate>gap.max)candidate=gap.max;
+    const distance=Math.abs(candidate-desiredStart);
+    const tie=Math.abs(distance-bestDistance)<=eps;
+    if(distance<bestDistance-eps||(tie&&((movingLeft&&candidate<best)||(!movingLeft&&candidate>best)))){
+      bestDistance=distance;best=candidate;
+    }
+  }
+  return Math.max(0,best);
+}
 function onClipPointerDown(e){
   if(e.button!==0)return;e.stopPropagation();const el=e.currentTarget,c=state.clips.find(x=>x.id===el.dataset.id);if(!c)return;
+  e.preventDefault();
   if(e.ctrlKey||e.metaKey||e.shiftKey){selectByPointer('clip',c.id,e);renderTimeline();renderInspector();setTime(state.currentTime,false);return}
   if(!state.selectedClipIds.includes(c.id)||state.selectedClipIds.length!==1||state.selectedSourceIds.length){
     setSingleSelection('clip',c.id);$$('.clip').forEach(node=>node.classList.toggle('selected',node.dataset.id===c.id));$$('.base-clip[data-source-id]').forEach(node=>node.classList.remove('selected-source'));renderInspector();
   }else{state.selectedId=c.id;state.selectionAnchor={kind:'clip',id:c.id}}
-  const handle=e.target.closest('.handle');const mode=handle?(handle.classList.contains('left')?'resizeL':'resizeR'):'move';
-  pushHistory();const startX=e.clientX,orig={start:c.start,duration:c.duration,track:c.track},origEnd=c.start+c.duration;el.setPointerCapture?.(e.pointerId);
+  const handle=e.target.closest('.handle'),mode=handle?(handle.classList.contains('left')?'resizeL':'resizeR'):'move';
+  const startX=e.clientX,orig={start:c.start,duration:c.duration,track:c.track},origEnd=c.start+c.duration,pointerId=e.pointerId;let dragging=false,saved=false;
   const syncTransitionNodes=()=>{const lane=document.querySelector(`.lane.adjustment[data-track="${c.track}"]`);document.querySelectorAll(`.transition-node[data-transition-for="${c.id}"]`).forEach(node=>{node.style.left=`${c.start*state.pps}px`;if(lane&&node.parentElement!==lane)lane.appendChild(node)})};
-  const move=ev=>{
-    const dx=(ev.clientX-startX)/state.pps;let snap=null;
+  const move=rawEv=>{
+    if(rawEv.pointerId!==pointerId)return;
+    const coalesced=rawEv.getCoalescedEvents?.(),ev=coalesced?.length?coalesced[coalesced.length-1]:rawEv;
+    const dx=(ev.clientX-startX)/state.pps;if(!dragging&&Math.abs(ev.clientX-startX)<2)return;rawEv.preventDefault();dragging=true;if(!saved){pushHistory();saved=true}
+    let snap=null;
     if(mode==='move'){
-      let desired=orig.start+dx,targetTrack=c.track;const lane=document.elementFromPoint(ev.clientX,ev.clientY)?.closest('.lane.adjustment');if(lane)targetTrack=+lane.dataset.track;
-      const res=snapClipMove(desired,c.duration,c.id);desired=res.value;snap=res.snap;
-      const fitted=fitStartInTrack(targetTrack,clamp(desired,0,Math.max(0,state.duration-c.duration)),c.duration,c.id);
-      if(fitted!=null){c.start=fitted;c.track=targetTrack;if(el.parentElement!==document.querySelector(`.lane.adjustment[data-track="${targetTrack}"]`))document.querySelector(`.lane.adjustment[data-track="${targetTrack}"]`)?.appendChild(el)}
+      // Camera layers now use the same free timeline model as GLB clips: they can
+      // move to any non-negative time and can extend the sequence past its old end.
+      let desired=Math.max(0,orig.start+dx),targetTrack=c.track;
+      const lane=document.elementFromPoint(ev.clientX,ev.clientY)?.closest('.lane.adjustment');if(lane)targetTrack=+lane.dataset.track;
+
+      // Resolve non-overlap first. Unlike the v30 hard-stop model, this projects the
+      // pointer to the nearest valid free interval, so a layer can move from after a
+      // neighbour to before it (and vice versa) without ever occupying the same time.
+      desired=clampCameraMoveStart(orig,targetTrack,desired,c.id);
+
+      // Magnetic snapping is a separate concern and is controlled exclusively by
+      // Snap On/Off. Accept a snapped position only when it is also collision-safe.
+      const res=snapClipMove(desired,c.duration,c.id),snappedStart=res.value;
+      if(state.snap&&snappedStart>=-1e-7&&!cameraLayerOverlaps(targetTrack,Math.max(0,snappedStart),c.duration,c.id)){
+        desired=Math.max(0,snappedStart);snap=res.snap;
+      }else snap=null;
+      c.start=desired;c.track=targetTrack;
+      const targetLane=document.querySelector(`.lane.adjustment[data-track="${targetTrack}"]`);if(targetLane&&el.parentElement!==targetLane)targetLane.appendChild(el);
       el.style.left=`${c.start*state.pps}px`;
     }else if(mode==='resizeR'){
       const neighbors=state.clips.filter(x=>x.track===c.track&&x.id!==c.id&&x.start>=c.start).sort((a,b)=>a.start-b.start),maxEnd=neighbors.length?neighbors[0].start:state.duration;
@@ -1298,10 +1359,18 @@ function onClipPointerDown(e){
       const neighbors=state.clips.filter(x=>x.track===c.track&&x.id!==c.id&&x.start+x.duration<=origEnd).sort((a,b)=>(b.start+b.duration)-(a.start+a.duration)),minStart=neighbors.length?neighbors[0].start+neighbors[0].duration:0;
       let ns=orig.start+dx;const res=snapTime(ns,c.id);ns=clamp(res.value,minStart,origEnd-MIN_CLIP);snap=res.snap;c.start=ns;c.duration=origEnd-ns;el.style.left=`${c.start*state.pps}px`;el.style.width=`${Math.max(14,c.duration*state.pps)}px`;
     }
-    syncTransitionNodes();syncInspectorTiming(c);showSnap(snap);setTime(state.currentTime,false);
+    const sourceMax=state.sources.length?Math.max(...state.sources.map(sourceEnd)):0,cameraMax=state.clips.length?Math.max(...state.clips.map(x=>x.start+x.duration)):0,liveEnd=Math.max(state.duration,sourceMax,cameraMax);
+    if(liveEnd>state.duration){state.duration=liveEnd;$('#timelineContent').style.width=`${timelineWidth()}px`}
+    syncTransitionNodes();syncInspectorTiming(c);showSnap(state.snap?snap:null);setTime(state.currentTime,false);
   };
-  const up=()=>{showSnap(null);window.removeEventListener('pointermove',move);window.removeEventListener('pointerup',up);renderTimeline();renderInspector();setTime(state.currentTime,false)};
-  window.addEventListener('pointermove',move);window.addEventListener('pointerup',up,{once:true});
+  const up=rawEv=>{
+    if(rawEv?.pointerId!=null&&rawEv.pointerId!==pointerId)return;
+    window.removeEventListener('pointermove',move,true);window.removeEventListener('pointerup',up,true);window.removeEventListener('pointercancel',up,true);window.removeEventListener('blur',up,true);showSnap(null);
+    if(dragging){recomputeSourceTimeline();renderInspector();setTime(state.currentTime,false)}
+  };
+  // Global capture-phase listeners keep Camera-layer dragging alive even when the
+  // pointer leaves the layer rectangle or the timeline viewport.
+  window.addEventListener('pointermove',move,{capture:true,passive:false});window.addEventListener('pointerup',up,{capture:true});window.addEventListener('pointercancel',up,{capture:true});window.addEventListener('blur',up,{capture:true});
 }
 
 function bindAdjustmentDropLane(lane,track){
@@ -1568,7 +1637,7 @@ $('#fpsInput').addEventListener('change',()=>setTime(state.currentTime,false));
 const adjustmentSource=$('#adjustmentSource');
 adjustmentSource.addEventListener('dragstart',e=>{e.dataTransfer.setData('application/x-camera-adjustment','1');e.dataTransfer.effectAllowed='copy';adjustmentSource.classList.add('dragging')});
 adjustmentSource.addEventListener('dragend',()=>{adjustmentSource.classList.remove('dragging');$$('.lane.adjustment.drop-target').forEach(x=>x.classList.remove('drop-target'))});
-$('#snapBtn').onclick=()=>{state.snap=!state.snap;const b=$('#snapBtn');b.classList.toggle('active',state.snap);b.setAttribute('aria-pressed',String(state.snap));b.title=`Snap · ${state.snap?'On':'Off'}`;toast(`Snap · ${state.snap?'On':'Off'}`)};
+$('#snapBtn').onclick=()=>{state.snap=!state.snap;const b=$('#snapBtn');b.classList.toggle('active',state.snap);b.setAttribute('aria-pressed',String(state.snap));b.title=`Snap · ${state.snap?'On':'Off'}`;if(!state.snap)showSnap(null);toast(`Snap · ${state.snap?'On':'Off'}`)};
 $('#timelineZoom').oninput=e=>{state.pps=+e.target.value;renderTimeline()};
 $('#timelineScroll').addEventListener('wheel',e=>{if(e.ctrlKey||e.metaKey){e.preventDefault();state.pps=clamp(state.pps-e.deltaY*.12,45,220);$('#timelineZoom').value=state.pps;renderTimeline()}},{passive:false});
 function beginMarqueeSelection(e){
