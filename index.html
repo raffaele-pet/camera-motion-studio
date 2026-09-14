@@ -480,9 +480,12 @@ function getEntryTransition(incoming,create=false){
 }
 function entryFusionValue(incoming){return clamp(getEntryTransition(incoming)?.fusion??DEFAULT_FUSION,0,1)}
 function transitionHalfWindow(source,incoming,fusion){
+  const f=clamp(fusion,0,1);
+  if(f<=.001)return 0;
   const sourceDuration=source?.duration||incoming.duration;
   const maxHalf=Math.min(.45,Math.max(.07,Math.min(sourceDuration,incoming.duration)*.22));
-  return lerp(.018,maxHalf,clamp(fusion,0,1));
+  // Fusion is a true 0..100% control: 0% has no temporal window at all.
+  return maxHalf*f;
 }
 function entryTransitions(){
   return [...state.clips].sort((a,b)=>a.start-b.start||a.track-b.track).map(incoming=>({incoming,source:transitionSourceFor(incoming),join:incoming.start,fusion:entryFusionValue(incoming)}));
@@ -507,7 +510,9 @@ function rawCameraStateAt(time){
 
   for(const c of ordered){
     if(c.type==='stop')continue;
-    if(time<=c.start)continue;
+    // Include the exact layer start. Progressive motions still have raw=0 there,
+    // while Static Transform must already be fully active on its first frame.
+    if(time<c.start)continue;
     const evaluationTime=Math.min(time,stopCaps.get(c.id)??time);
     const raw=clamp((evaluationTime-c.start)/Math.max(.02,c.duration),0,1);
     const amount=(c.type==='staticTransform'||c.type==='resetCamera')?1:(c.intensity/100)*raw;
@@ -1031,7 +1036,8 @@ function findPlacement(track){
 function addClip(type='none',track=null,startOverride=null){
   if(state.tracks<=0){toast('Add a Camera track first');return null}
   if(track==null){const sel=state.clips.find(c=>c.id===state.selectedId);track=sel?sel.track:0}
-  track=clamp(track,0,state.tracks-1);const desired=startOverride==null?findPlacement(track):clamp(startOverride,0,state.duration);
+  track=clamp(track,0,state.tracks-1);let desired=startOverride==null?findPlacement(track):clamp(startOverride,0,state.duration);
+  if(state.snap&&startOverride!=null)desired=snapClipMove(desired,Math.min(2.0,Math.max(MIN_CLIP,state.duration-desired)),null).value;
   const trackIsEmpty=!state.clips.some(c=>c.track===track);
   const emptyTrackStart=clamp(desired,0,Math.max(0,state.duration-MIN_CLIP));
   const placement=trackIsEmpty
@@ -1112,7 +1118,7 @@ function renderTimeline(){
   const baseLane=document.createElement('div');baseLane.className='lane base-lane';content.appendChild(baseLane);
   if(state.sources.length){
     for(const source of [...state.sources].sort((a,b)=>a.start-b.start)){
-      const b=document.createElement('div');b.className=`base-clip${state.selectedSourceIds.includes(source.id)?' selected-source':''}`;b.dataset.sourceId=source.id;b.style.left=`${source.start*state.pps+3}px`;b.style.width=`${Math.max(20,source.duration*state.pps-6)}px`;
+      const b=document.createElement('div');b.className=`base-clip${state.selectedSourceIds.includes(source.id)?' selected-source':''}`;b.dataset.sourceId=source.id;b.style.left=`${source.start*state.pps}px`;b.style.width=`${Math.max(20,source.duration*state.pps)}px`;
       const thumbs=document.createElement('div');thumbs.className='thumbs';if(source.thumbnails?.length){source.thumbnails.forEach(src=>{const im=document.createElement('img');im.src=src;im.draggable=false;im.setAttribute('draggable','false');thumbs.appendChild(im)})}b.appendChild(thumbs);
       const bl=document.createElement('div');bl.className='base-label';bl.textContent=`${source.name} · ${sourceAnimationLabel(source)} · ${source.duration.toFixed(2)}s`;b.appendChild(bl);
       const lh=document.createElement('span');lh.className='source-handle left';const rh=document.createElement('span');rh.className='source-handle right';b.append(lh,rh);
@@ -1196,7 +1202,7 @@ function cutSourceAt(source,time){
 function onSourcePointerDown(e){
   if(e.button!==0)return;e.stopPropagation();const el=e.currentTarget,source=state.sources.find(s=>s.id===el.dataset.sourceId);if(!source)return;
   if(state.editTool==='cut'){
-    e.preventDefault();const lane=el.closest('.base-lane'),rect=lane.getBoundingClientRect(),time=Math.max(0,(e.clientX-rect.left-3)/state.pps);cutSourceAt(source,time);return;
+    e.preventDefault();const lane=el.closest('.base-lane'),rect=lane.getBoundingClientRect(),time=Math.max(0,(e.clientX-rect.left)/state.pps);cutSourceAt(source,time);return;
   }
   // Prevent the browser's native image/text drag from stealing the pointer stream.
   // GLB clips use our own pointer-based timeline dragging instead.
@@ -1215,11 +1221,11 @@ function onSourcePointerDown(e){
     if(mode==='move'){
       let desiredDelta=dx;const snapRes=sourceSnapTime(sourceOrig.start+desiredDelta,excludeIds);desiredDelta=snapRes.value-sourceOrig.start;const delta=clampSourceMoveDelta(groupSpecs,desiredDelta);
       snap=Math.abs(delta-desiredDelta)<1e-7?snapRes.snap:null;
-      for(const s of group){const o=originals.get(s.id);s.start=Math.max(0,o.start+delta);const node=document.querySelector(`.base-clip[data-source-id="${s.id}"]`);if(node)node.style.left=`${s.start*state.pps+3}px`}
+      for(const s of group){const o=originals.get(s.id);s.start=Math.max(0,o.start+delta);const node=document.querySelector(`.base-clip[data-source-id="${s.id}"]`);if(node)node.style.left=`${s.start*state.pps}px`}
     }else if(mode==='resizeL'){
-      const {prevEnd}=sourceNeighborBounds(source),earliestByMedia=sourceOrig.start-sourceOrig.sourceOffset;let ns=clamp(sourceOrig.start+dx,Math.max(0,prevEnd,earliestByMedia),origEnd-MIN_SOURCE_CLIP);const res=sourceSnapTime(ns,new Set([source.id]));ns=clamp(res.value,Math.max(0,prevEnd,earliestByMedia),origEnd-MIN_SOURCE_CLIP);snap=res.snap;source.start=ns;source.sourceOffset=sourceOrig.sourceOffset+(ns-sourceOrig.start);source.duration=origEnd-ns;el.style.left=`${source.start*state.pps+3}px`;el.style.width=`${Math.max(20,source.duration*state.pps-6)}px`;
+      const {prevEnd}=sourceNeighborBounds(source),earliestByMedia=sourceOrig.start-sourceOrig.sourceOffset;let ns=clamp(sourceOrig.start+dx,Math.max(0,prevEnd,earliestByMedia),origEnd-MIN_SOURCE_CLIP);const res=sourceSnapTime(ns,new Set([source.id]));ns=clamp(res.value,Math.max(0,prevEnd,earliestByMedia),origEnd-MIN_SOURCE_CLIP);snap=res.snap;source.start=ns;source.sourceOffset=sourceOrig.sourceOffset+(ns-sourceOrig.start);source.duration=origEnd-ns;el.style.left=`${source.start*state.pps}px`;el.style.width=`${Math.max(20,source.duration*state.pps)}px`;
     }else{
-      const {nextStart}=sourceNeighborBounds(source),maxByMedia=sourceOrig.start+(source.mediaDuration-sourceOrig.sourceOffset);let end=clamp(origEnd+dx,source.start+MIN_SOURCE_CLIP,Math.min(nextStart,maxByMedia));const res=sourceSnapTime(end,new Set([source.id]));end=clamp(res.value,source.start+MIN_SOURCE_CLIP,Math.min(nextStart,maxByMedia));snap=res.snap;source.duration=end-source.start;el.style.width=`${Math.max(20,source.duration*state.pps-6)}px`;
+      const {nextStart}=sourceNeighborBounds(source),maxByMedia=sourceOrig.start+(source.mediaDuration-sourceOrig.sourceOffset);let end=clamp(origEnd+dx,source.start+MIN_SOURCE_CLIP,Math.min(nextStart,maxByMedia));const res=sourceSnapTime(end,new Set([source.id]));end=clamp(res.value,source.start+MIN_SOURCE_CLIP,Math.min(nextStart,maxByMedia));snap=res.snap;source.duration=end-source.start;el.style.width=`${Math.max(20,source.duration*state.pps)}px`;
     }
     const liveEnd=Math.max(...state.sources.map(sourceEnd),state.duration);if(liveEnd>state.duration){state.duration=liveEnd;$('#timelineContent').style.width=`${timelineWidth()}px`}showSnap(snap);setTime(Math.min(state.currentTime,state.duration),false);
   };
@@ -1228,13 +1234,44 @@ function onSourcePointerDown(e){
   window.addEventListener('pointermove',move,{capture:true,passive:false});window.addEventListener('pointerup',up,{capture:true});window.addEventListener('pointercancel',up,{capture:true});window.addEventListener('blur',up,{capture:true});
 }
 
+const SNAP_EDGE_PX=10;
+const SNAP_GRID_PX=3.5;
+function timelineSnapCandidates(excludeId=null){
+  const candidates=[0,state.duration,state.currentTime];
+  // GLB clip edges and Camera layer edges share the exact same timeline clock.
+  for(const s of state.sources)candidates.push(s.start,sourceEnd(s));
+  for(const c of state.clips)if(c.id!==excludeId)candidates.push(c.start,c.start+c.duration);
+  return [...new Set(candidates.filter(Number.isFinite).map(v=>Math.max(0,v)))];
+}
+function snapThresholdSeconds(px=SNAP_EDGE_PX){
+  // Screen-space magnetism: ~10px at every zoom level. In seconds this becomes
+  // tighter when zoomed in and wider when zoomed out, like a video editor.
+  return px/Math.max(1,state.pps);
+}
 function snapTime(value,excludeId=null){
   value=clamp(value,0,state.duration);if(!state.snap)return {value,snap:null};
-  const threshold=8/state.pps;const candidates=[0,state.duration,state.currentTime];
-  for(const c of state.clips)if(c.id!==excludeId)candidates.push(c.start,c.start+c.duration);
-  let best=null,bd=Infinity;for(const c of candidates){const d=Math.abs(c-value);if(d<bd&&d<=threshold){bd=d;best=c}}
+  const threshold=snapThresholdSeconds(),candidates=timelineSnapCandidates(excludeId);
+  let best=null,bd=Infinity;for(const candidate of candidates){const d=Math.abs(candidate-value);if(d<bd&&d<=threshold){bd=d;best=candidate}}
   if(best!=null)return {value:best,snap:best};
-  const grid=.1;const g=Math.round(value/grid)*grid;return Math.abs(g-value)<=threshold*.55?{value:g,snap:g}:{value,snap:null};
+  const grid=.1,g=Math.round(value/grid)*grid,gridThreshold=snapThresholdSeconds(SNAP_GRID_PX);
+  return Math.abs(g-value)<=gridThreshold?{value:g,snap:g}:{value,snap:null};
+}
+function snapClipMove(start,duration,excludeId=null){
+  if(!state.snap)return {value:start,snap:null};
+  const threshold=snapThresholdSeconds(),candidates=timelineSnapCandidates(excludeId),edges=[start,start+duration];
+  let bestDelta=0,bestSnap=null,bestDistance=Infinity;
+  for(const edge of edges){
+    for(const candidate of candidates){
+      const delta=candidate-edge,d=Math.abs(delta);
+      if(d<=threshold&&d<bestDistance){bestDistance=d;bestDelta=delta;bestSnap=candidate}
+    }
+  }
+  if(bestSnap!=null)return {value:start+bestDelta,snap:bestSnap};
+  // Gentle grid fallback: only a few screen pixels, so it never feels like a hard pull.
+  const grid=.1,gridThreshold=snapThresholdSeconds(SNAP_GRID_PX);
+  let gridDelta=0,gridSnap=null,gridDistance=Infinity;
+  for(const edge of edges){const g=Math.round(edge/grid)*grid,d=Math.abs(g-edge);if(d<=gridThreshold&&d<gridDistance){gridDistance=d;gridDelta=g-edge;gridSnap=g}}
+  return gridSnap==null?{value:start,snap:null}:{value:start+gridDelta,snap:gridSnap};
 }
 function showSnap(x){const l=$('#snapline');if(!l)return;if(x==null){l.style.display='none'}else{l.style.display='block';l.style.left=`${x*state.pps}px`}}
 function onClipPointerDown(e){
@@ -1250,7 +1287,7 @@ function onClipPointerDown(e){
     const dx=(ev.clientX-startX)/state.pps;let snap=null;
     if(mode==='move'){
       let desired=orig.start+dx,targetTrack=c.track;const lane=document.elementFromPoint(ev.clientX,ev.clientY)?.closest('.lane.adjustment');if(lane)targetTrack=+lane.dataset.track;
-      const res=snapTime(desired,c.id);desired=res.value;snap=res.snap;
+      const res=snapClipMove(desired,c.duration,c.id);desired=res.value;snap=res.snap;
       const fitted=fitStartInTrack(targetTrack,clamp(desired,0,Math.max(0,state.duration-c.duration)),c.duration,c.id);
       if(fitted!=null){c.start=fitted;c.track=targetTrack;if(el.parentElement!==document.querySelector(`.lane.adjustment[data-track="${targetTrack}"]`))document.querySelector(`.lane.adjustment[data-track="${targetTrack}"]`)?.appendChild(el)}
       el.style.left=`${c.start*state.pps}px`;
