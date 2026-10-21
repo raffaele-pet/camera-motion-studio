@@ -10,6 +10,8 @@ https://raffaele-pet.github.io/camera-motion-studio/
 
 GLB files are processed locally in the browser. Rendering and MP4 export also run on the user's device.
 
+The bundled **Fox.glb** sample loads automatically on every fresh page load, with Survey, Walk and Run animations available in the animation selector. It is a normal editable timeline source; you can trim, duplicate or remove it, and import additional GLBs with **Import GLB**. The model ships with the project in `assets/models/Fox.glb`, with [credits and license information](assets/models/README.md).
+
 For best MP4 export compatibility, use a current Chromium-based browser such as Chrome or Edge.
 
 ## Add a camera motion
@@ -25,7 +27,7 @@ The orange icons are bundled locally from [Lucide](https://lucide.dev/icons); th
 With Node.js installed, run:
 
 ```sh
-node --test tests/camera-library.test.cjs
+node --test tests/*.test.cjs
 ```
 
 The checks cover all preset drag/drop payloads, selected layers, invalid payloads, snapping, non-overlap, timeline extension and bundled icon references.
